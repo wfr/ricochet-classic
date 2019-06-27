@@ -40,6 +40,12 @@ ConversationModel::ConversationModel(QObject *parent)
     , m_contact(0)
     , m_unreadCount(0)
 {
+    m_settings = new SettingsObject(QStringLiteral("ui"));
+    connect(m_settings, &SettingsObject::modified, this, &ConversationModel::onSettingsModified);
+
+    m_expire_timer = new QTimer(this);
+    m_expire_timer->setSingleShot(true);
+    connect(m_expire_timer, SIGNAL(timeout()), this, SLOT(expire()));
 }
 
 void ConversationModel::setContact(ContactUser *contact)
@@ -118,6 +124,7 @@ void ConversationModel::sendMessage(const QString &text)
     messages.prepend(message);
     endInsertRows();
     prune();
+    expire();
 }
 
 void ConversationModel::sendQueuedMessages()
@@ -201,6 +208,7 @@ void ConversationModel::messageReceived(const QString &text, const QDateTime &ti
     messages.insert(row, message);
     endInsertRows();
     prune();
+    expire();
 
     m_unreadCount++;
     emit unreadCountChanged();
@@ -258,12 +266,22 @@ void ConversationModel::resetUnreadCount()
         return;
     m_unreadCount = 0;
     emit unreadCountChanged();
+
+    expire();
 }
 
 void ConversationModel::onContactStatusChanged()
 {
     // Update in case section has changed
     emit dataChanged(index(0, 0), index(rowCount()-1, 0), QVector<int>() << SectionRole);
+}
+
+void ConversationModel::onSettingsModified(const QString &key, const QJsonValue &value)
+{
+    Q_UNUSED(value);
+    if (key == QLatin1String("deleteMessages") || key == QLatin1String("deleteMessagesAfter")) {
+        expire();
+    }
 }
 
 QHash<int,QByteArray> ConversationModel::roleNames() const
@@ -341,5 +359,43 @@ void ConversationModel::prune()
             messages.removeLast();
         }
         endRemoveRows();
+    }
+}
+
+void ConversationModel::expire()
+{
+    if (m_settings->read("deleteMessages").toBool(false)) {
+        int seconds = m_settings->read("deleteMessagesAfter").toInt(0);
+        if (seconds) {
+            expire(seconds);
+        }
+    }
+}
+
+void ConversationModel::expire(int seconds)
+{
+    const QDateTime now = QDateTime::currentDateTime();
+    const QDateTime cutoff = now.addSecs(-seconds);
+    int first = messages.size();
+    for (int i = first - 1; i >= 0; i--) {
+        if (messages[i].time <= cutoff) {
+            first = i;
+        } else {
+            break;
+        }
+    }
+    first = std::max(first, m_unreadCount);
+    if (first < messages.size()) {
+        beginRemoveRows(QModelIndex(), first, messages.size()-1);
+        while (messages.size() > first) {
+            messages.removeLast();
+        }
+        endRemoveRows();
+    }
+
+    if (messages.size() && !m_unreadCount) {
+        const qint64 msecs_expire = 1000 * (qint64)seconds - messages.last().time.msecsTo(now);
+        const qint64 msecs_sleep = std::max((qint64)100, msecs_expire + 1);
+        m_expire_timer->start(msecs_sleep);
     }
 }
